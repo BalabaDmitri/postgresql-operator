@@ -8,10 +8,12 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, get_args
+from typing import Dict, List, Literal, Optional, Set, Tuple, get_args
 
 import psycopg2
 from charms.data_platform_libs.v0.data_interfaces import DataPeerData, DataPeerUnitData
@@ -28,6 +30,8 @@ from charms.postgresql_k8s.v0.postgresql import (
 )
 from charms.postgresql_k8s.v0.postgresql_tls import PostgreSQLTLS
 from charms.rolling_ops.v0.rollingops import RollingOpsManager, RunWithLock
+from charms.tempo_k8s.v1.charm_tracing import trace_charm
+from charms.tempo_k8s.v2.tracing import TracingEndpointRequirer
 from ops import JujuVersion
 from ops.charm import (
     ActionEvent,
@@ -50,7 +54,7 @@ from ops.model import (
 )
 from tenacity import RetryError, Retrying, retry, stop_after_attempt, stop_after_delay, wait_fixed
 
-from backups import PostgreSQLBackups
+from backups import CANNOT_RESTORE_PITR, MOVE_RESTORED_CLUSTER_TO_ANOTHER_BUCKET, PostgreSQLBackups
 from cluster import (
     NotReadyError,
     Patroni,
@@ -82,12 +86,18 @@ from constants import (
     TLS_CA_FILE,
     TLS_CERT_FILE,
     TLS_KEY_FILE,
+    TRACING_PROTOCOL,
+    TRACING_RELATION_NAME,
     UNIT_SCOPE,
     UPGRADE_RELATION,
     USER,
     USER_PASSWORD_KEY,
 )
-from relations.async_replication import PostgreSQLAsyncReplication
+from relations.async_replication import (
+    REPLICATION_CONSUMER_RELATION,
+    REPLICATION_OFFER_RELATION,
+    PostgreSQLAsyncReplication,
+)
 from relations.db import EXTENSIONS_BLOCKING_MESSAGE, DbProvides
 from relations.postgresql_provider import PostgreSQLProvider
 from upgrade import PostgreSQLUpgrade, get_postgresql_dependencies_model
@@ -102,6 +112,22 @@ DIFFERENT_VERSIONS_PSQL_BLOCKING_MESSAGE = "Please select the correct version of
 Scopes = Literal[APP_SCOPE, UNIT_SCOPE]
 
 
+@trace_charm(
+    tracing_endpoint="tracing_endpoint",
+    extra_types=(
+        ClusterTopologyObserver,
+        COSAgentProvider,
+        DbProvides,
+        Patroni,
+        PostgreSQL,
+        PostgreSQLAsyncReplication,
+        PostgreSQLBackups,
+        PostgreSQLProvider,
+        PostgreSQLTLS,
+        PostgreSQLUpgrade,
+        RollingOpsManager,
+    ),
+)
 class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
     """Charmed Operator for the PostgreSQL database."""
 
@@ -146,9 +172,6 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.get_primary_action, self._on_get_primary)
         self.framework.observe(self.on[PEER].relation_changed, self._on_peer_relation_changed)
-        self.framework.observe(
-            self.on[UPGRADE_RELATION].relation_changed, self._on_upgrade_relation_changed
-        )
         self.framework.observe(self.on.secret_changed, self._on_peer_relation_changed)
         self.framework.observe(self.on[PEER].relation_departed, self._on_peer_relation_departed)
         self.framework.observe(self.on.pgdata_storage_detaching, self._on_pgdata_storage_detaching)
@@ -187,6 +210,9 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             ],
             log_slots=[f"{POSTGRESQL_SNAP_NAME}:logs"],
         )
+        self._tracing = TracingEndpointRequirer(
+            self, relation_name=TRACING_RELATION_NAME, protocols=[TRACING_PROTOCOL]
+        )
 
     def patroni_scrape_config(self) -> List[Dict]:
         """Generates scrape config for the Patroni metrics endpoint."""
@@ -224,6 +250,12 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             return {}
 
         return relation.data[self.unit]
+
+    @property
+    def tracing_endpoint(self) -> Optional[str]:
+        """Otlp http endpoint for charm instrumentation."""
+        if self._tracing.is_ready():
+            return self._tracing.get_endpoint(TRACING_PROTOCOL)
 
     def _peer_data(self, scope: Scopes) -> Dict:
         """Return corresponding databag for app/unit."""
@@ -264,9 +296,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             return None
         secret_key = self._translate_field_to_secret_key(key)
         # Old translation in databag is to be taken
-        if key != secret_key and (
-            result := self.peer_relation_data(scope).fetch_my_relation_field(peers.id, key)
-        ):
+        if result := self.peer_relation_data(scope).fetch_my_relation_field(peers.id, key):
             return result
 
         return self.peer_relation_data(scope).get_secret(peers.id, secret_key)
@@ -282,10 +312,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         peers = self.model.get_relation(PEER)
         secret_key = self._translate_field_to_secret_key(key)
         # Old translation in databag is to be deleted
-        if key != secret_key and self.peer_relation_data(scope).fetch_my_relation_field(
-            peers.id, key
-        ):
-            self.peer_relation_data(scope).delete_relation_data(peers.id, [key])
+        self.peer_relation_data(scope).delete_relation_data(peers.id, [key])
         self.peer_relation_data(scope).set_secret(peers.id, secret_key, value)
 
     def remove_secret(self, scope: Scopes, key: str) -> None:
@@ -324,7 +351,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             logger.debug("primary endpoint early exit: Peer relation not joined yet.")
             return None
         try:
-            for attempt in Retrying(stop=stop_after_delay(60), wait=wait_fixed(3)):
+            for attempt in Retrying(stop=stop_after_delay(5), wait=wait_fixed(3)):
                 with attempt:
                     primary = self._patroni.get_primary()
                     if primary is None and (standby_leader := self._patroni.get_standby_leader()):
@@ -513,6 +540,13 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         except ValueError as e:
             self.unit.status = BlockedStatus("Configuration Error. Please check the logs")
             logger.error("Invalid configuration: %s", str(e))
+            return
+
+        # If PITR restore failed, then wait it for resolve.
+        if (
+            "restoring-backup" in self.app_peer_data or "restore-to-time" in self.app_peer_data
+        ) and isinstance(self.unit.status, BlockedStatus):
+            event.defer()
             return
 
         # Start can be called here multiple times as it's idempotent.
@@ -845,6 +879,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
 
     def _on_install(self, event: InstallEvent) -> None:
         """Install prerequisites for the application."""
+        logger.debug("Install start time: %s", datetime.now())
         if not self._is_storage_attached():
             self._reboot_on_detached_storage(event)
             return
@@ -1035,7 +1070,9 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
 
         # Doesn't try to bootstrap the cluster if it's in a blocked state
         # caused, for example, because a failed installation of packages.
-        if self.is_blocked:
+        if self.is_blocked and self.unit.status.message not in [
+            MOVE_RESTORED_CLUSTER_TO_ANOTHER_BUCKET
+        ]:
             logger.debug("Early exit on_start: Unit blocked")
             return False
 
@@ -1069,10 +1106,18 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # On replicas, only prepare for starting the instance later.
         if not self.unit.is_leader():
             self._start_replica(event)
+            self._restart_services_after_reboot()
             return
 
         # Bootstrap the cluster in the leader unit.
         self._start_primary(event)
+        self._restart_services_after_reboot()
+
+    def _restart_services_after_reboot(self):
+        """Restart the Patroni and pgBackRest after a reboot."""
+        if self._unit_ip in self.members_ips:
+            self._patroni.start_patroni()
+            self.backup.start_stop_pgbackrest_service()
 
     def _setup_exporter(self) -> None:
         """Set up postgresql_exporter options."""
@@ -1152,7 +1197,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # was fully initialised.
         self.enable_disable_extensions()
 
-        self.unit.status = ActiveStatus()
+        logger.debug("Active workload time: %s", datetime.now())
+        self._set_primary_status_message()
 
     def _start_replica(self, event) -> None:
         """Configure the replica if the cluster was already initialised."""
@@ -1216,15 +1262,42 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             )
             return
 
-        # Update the password in the PostgreSQL instance.
-        try:
-            self.postgresql.update_user_password(username, password)
-        except PostgreSQLUpdateUserPasswordError as e:
-            logger.exception(e)
+        replication_offer_relation = self.model.get_relation(REPLICATION_OFFER_RELATION)
+        if (
+            replication_offer_relation is not None
+            and not self.async_replication.is_primary_cluster()
+        ):
+            # Update the password in the other cluster PostgreSQL primary instance.
+            other_cluster_endpoints = self.async_replication.get_all_primary_cluster_endpoints()
+            other_cluster_primary = self._patroni.get_primary(
+                alternative_endpoints=other_cluster_endpoints
+            )
+            other_cluster_primary_ip = [
+                replication_offer_relation.data[unit].get("private-address")
+                for unit in replication_offer_relation.units
+                if unit.name.replace("/", "-") == other_cluster_primary
+            ][0]
+            try:
+                self.postgresql.update_user_password(
+                    username, password, database_host=other_cluster_primary_ip
+                )
+            except PostgreSQLUpdateUserPasswordError as e:
+                logger.exception(e)
+                event.fail("Failed changing the password.")
+                return
+        elif self.model.get_relation(REPLICATION_CONSUMER_RELATION) is not None:
             event.fail(
-                "Failed changing the password: Not all members healthy or finished initial sync."
+                "Failed changing the password: This action can be ran only in the cluster from the offer side."
             )
             return
+        else:
+            # Update the password in this cluster PostgreSQL primary instance.
+            try:
+                self.postgresql.update_user_password(username, password)
+            except PostgreSQLUpdateUserPasswordError as e:
+                logger.exception(e)
+                event.fail("Failed changing the password.")
+                return
 
         # Update the password in the secret store.
         self.set_secret(APP_SCOPE, f"{username}-password", password)
@@ -1233,9 +1306,6 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # Other units Patroni configuration will be reloaded in the peer relation changed event.
         self.update_config()
 
-        # Update the password in the async replication data.
-        self.async_replication.update_async_replication_data()
-
         event.set_results({"password": password})
 
     def _on_update_status(self, _) -> None:
@@ -1243,7 +1313,16 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         if not self._can_run_on_update_status():
             return
 
-        if "restoring-backup" in self.app_peer_data:
+        if "restoring-backup" in self.app_peer_data or "restore-to-time" in self.app_peer_data:
+            if "restore-to-time" in self.app_peer_data and all(self.is_pitr_failed()):
+                logger.error(
+                    "Restore failed: database service failed to reach point-in-time-recovery target. "
+                    "You can launch another restore with different parameters"
+                )
+                self.log_pitr_last_transaction_time()
+                self.unit.status = BlockedStatus(CANNOT_RESTORE_PITR)
+                return
+
             if "failed" in self._patroni.get_member_status(self._member_name):
                 logger.error("Restore failed: database service failed to start")
                 self.unit.status = BlockedStatus("Failed to restore backup")
@@ -1254,8 +1333,13 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
                 return
 
             # Remove the restoring backup flag and the restore stanza name.
-            self.app_peer_data.update({"restoring-backup": "", "restore-stanza": ""})
+            self.app_peer_data.update({
+                "restoring-backup": "",
+                "restore-stanza": "",
+                "restore-to-time": "",
+            })
             self.update_config()
+            self.restore_patroni_restart_condition()
             logger.info("Restore succeeded")
 
             can_use_s3_repository, validation_message = self.backup.can_use_s3_repository()
@@ -1348,10 +1432,19 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
     def _set_primary_status_message(self) -> None:
         """Display 'Primary' in the unit status message if the current unit is the primary."""
         try:
+            if "require-change-bucket-after-restore" in self.app_peer_data:
+                if self.unit.is_leader():
+                    self.app_peer_data.update({
+                        "restoring-backup": "",
+                        "restore-stanza": "",
+                        "restore-to-time": "",
+                    })
+                self.unit.status = BlockedStatus(MOVE_RESTORED_CLUSTER_TO_ANOTHER_BUCKET)
+                return
             if self._patroni.get_primary(unit_name_pattern=True) == self.unit.name:
                 self.unit.status = ActiveStatus("Primary")
             elif self.is_standby_leader:
-                self.unit.status = ActiveStatus("Standby Leader")
+                self.unit.status = ActiveStatus("Standby")
             elif self._patroni.member_started:
                 self.unit.status = ActiveStatus()
         except (RetryError, ConnectionError) as e:
@@ -1547,8 +1640,13 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             is_creating_backup=is_creating_backup,
             enable_tls=enable_tls,
             backup_id=self.app_peer_data.get("restoring-backup"),
+            pitr_target=self.app_peer_data.get("restore-to-time"),
+            restore_to_latest=self.app_peer_data.get("restore-to-time", None) == "latest",
             stanza=self.app_peer_data.get("stanza"),
             restore_stanza=self.app_peer_data.get("restore-stanza"),
+            disable_pgbackrest_archiving=bool(
+                self.app_peer_data.get("require-change-bucket-after-restore", None)
+            ),
             parameters=pg_parameters,
         )
         if not self._is_workload_running:
@@ -1682,6 +1780,109 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         if peer_db_version != self._patroni.get_postgresql_version():
             self.unit.status = BlockedStatus(DIFFERENT_VERSIONS_PSQL_BLOCKING_MESSAGE)
         return
+
+    def override_patroni_restart_condition(
+        self, new_condition: str, repeat_cause: str | None
+    ) -> bool:
+        """Temporary override Patroni systemd service restart condition.
+
+        Executes only on current unit.
+
+        Args:
+            new_condition: new Patroni systemd service restart condition.
+            repeat_cause: whether this field is equal to the last success override operation repeat cause, Patroni
+                restart condition will be overridden (keeping the original restart condition reference untouched) and
+                success code will be returned. But if this field is distinct from previous repeat cause or None,
+                repeated operation will cause failure code will be returned.
+        """
+        current_condition = self._patroni.get_patroni_restart_condition()
+        if "overridden-patroni-restart-condition" in self.unit_peer_data:
+            original_condition = self.unit_peer_data["overridden-patroni-restart-condition"]
+            if repeat_cause is None:
+                logger.error(
+                    f"failure trying to override patroni restart condition to {new_condition}"
+                    f"as it already overridden from {original_condition} to {current_condition}"
+                )
+                return False
+            previous_repeat_cause = self.unit_peer_data.get(
+                "overridden-patroni-restart-condition-repeat-cause", None
+            )
+            if previous_repeat_cause != repeat_cause:
+                logger.error(
+                    f"failure trying to override patroni restart condition to {new_condition}"
+                    f"as it already overridden from {original_condition} to {current_condition}"
+                    f"and repeat cause is not equal: {previous_repeat_cause} != {repeat_cause}"
+                )
+                return False
+            # There repeat cause is equal
+            self._patroni.update_patroni_restart_condition(new_condition)
+            logger.debug(
+                f"Patroni restart condition re-overridden to {new_condition} within repeat cause {repeat_cause}"
+                f"(original restart condition reference is untouched and is {original_condition})"
+            )
+            return True
+        self._patroni.update_patroni_restart_condition(new_condition)
+        self.unit_peer_data["overridden-patroni-restart-condition"] = current_condition
+        if repeat_cause is not None:
+            self.unit_peer_data["overridden-patroni-restart-condition-repeat-cause"] = repeat_cause
+        logger.debug(
+            f"Patroni restart condition overridden from {current_condition} to {new_condition}"
+            f"{' with repeat cause ' + repeat_cause if repeat_cause is not None else ''}"
+        )
+        return True
+
+    def restore_patroni_restart_condition(self) -> None:
+        """Restore Patroni systemd service restart condition that was before overriding.
+
+        Will do nothing if not overridden. Executes only on current unit.
+        """
+        if "overridden-patroni-restart-condition" in self.unit_peer_data:
+            original_condition = self.unit_peer_data["overridden-patroni-restart-condition"]
+            self._patroni.update_patroni_restart_condition(original_condition)
+            self.unit_peer_data.update({
+                "overridden-patroni-restart-condition": "",
+                "overridden-patroni-restart-condition-repeat-cause": "",
+            })
+            logger.debug(f"restored Patroni restart condition to {original_condition}")
+        else:
+            logger.warning("not restoring patroni restart condition as it's not overridden")
+
+    def is_pitr_failed(self) -> Tuple[bool, bool]:
+        """Check if Patroni service failed to bootstrap cluster during point-in-time-recovery.
+
+        Typically, this means that database service failed to reach point-in-time-recovery target or has been
+        supplied with bad PITR parameter. Also, remembers last state and can provide info is it new event, or
+        it belongs to previous action. Executes only on current unit.
+
+        Returns:
+            Tuple[bool, bool]:
+                - Is patroni service failed to bootstrap cluster.
+                - Is it new fail, that wasn't observed previously.
+        """
+        patroni_logs = self._patroni.patroni_logs()
+        patroni_exceptions = re.findall(
+            r"^([0-9-:TZ]+).*patroni\.exceptions\.PatroniFatalException: Failed to bootstrap cluster$",
+            patroni_logs,
+            re.MULTILINE,
+        )
+        if len(patroni_exceptions) > 0:
+            old_pitr_fail_id = self.unit_peer_data.get("last_pitr_fail_id", None)
+            self.unit_peer_data["last_pitr_fail_id"] = patroni_exceptions[-1]
+            return True, patroni_exceptions[-1] != old_pitr_fail_id
+        return False, False
+
+    def log_pitr_last_transaction_time(self) -> None:
+        """Log to user last completed transaction time acquired from postgresql logs."""
+        postgresql_logs = self._patroni.last_postgresql_logs()
+        log_time = re.findall(
+            r"last completed transaction was at log time (.*)$",
+            postgresql_logs,
+            re.MULTILINE,
+        )
+        if len(log_time) > 0:
+            logger.info(f"Last completed transaction was at {log_time[-1]}")
+        else:
+            logger.error("Can't tell last completed transaction time")
 
 
 if __name__ == "__main__":

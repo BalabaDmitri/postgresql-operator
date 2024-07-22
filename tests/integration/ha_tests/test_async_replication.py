@@ -41,6 +41,8 @@ FAST_INTERVAL = "10s"
 IDLE_PERIOD = 5
 TIMEOUT = 2000
 
+DATA_INTEGRATOR_APP_NAME = "data-integrator"
+
 
 @contextlib.asynccontextmanager
 async def fast_forward(
@@ -115,6 +117,14 @@ async def test_deploy_async_replication_setup(
             num_units=CLUSTER_SIZE,
             config={"profile": "testing"},
         )
+    if not await app_name(ops_test, DATA_INTEGRATOR_APP_NAME):
+        await ops_test.model.deploy(
+            DATA_INTEGRATOR_APP_NAME,
+            num_units=1,
+            channel="latest/edge",
+            config={"database-name": "testdb"},
+        )
+        await ops_test.model.relate(DATABASE_APP_NAME, DATA_INTEGRATOR_APP_NAME)
     if not await app_name(ops_test, model=second_model):
         charm = await ops_test.build_charm(".")
         await second_model.deploy(
@@ -128,7 +138,7 @@ async def test_deploy_async_replication_setup(
     async with ops_test.fast_forward(), fast_forward(second_model):
         await gather(
             first_model.wait_for_idle(
-                apps=[DATABASE_APP_NAME, APPLICATION_NAME],
+                apps=[DATABASE_APP_NAME, APPLICATION_NAME, DATA_INTEGRATOR_APP_NAME],
                 status="active",
                 timeout=TIMEOUT,
             ),
@@ -156,10 +166,10 @@ async def test_async_replication(
     logger.info("checking whether writes are increasing")
     await are_writes_increasing(ops_test)
 
-    first_offer_command = f"offer {DATABASE_APP_NAME}:async-primary async-primary"
+    first_offer_command = f"offer {DATABASE_APP_NAME}:replication-offer replication-offer"
     await ops_test.juju(*first_offer_command.split())
     first_consume_command = (
-        f"consume -m {second_model.info.name} admin/{first_model.info.name}.async-primary"
+        f"consume -m {second_model.info.name} admin/{first_model.info.name}.replication-offer"
     )
     await ops_test.juju(*first_consume_command.split())
 
@@ -173,7 +183,7 @@ async def test_async_replication(
             ),
         )
 
-    await second_model.relate(DATABASE_APP_NAME, "async-primary")
+    await second_model.relate(DATABASE_APP_NAME, "replication-offer")
 
     async with ops_test.fast_forward(FAST_INTERVAL), fast_forward(second_model, FAST_INTERVAL):
         await gather(
@@ -193,7 +203,7 @@ async def test_async_replication(
     leader_unit = await get_leader_unit(ops_test, DATABASE_APP_NAME)
     assert leader_unit is not None, "No leader unit found"
     logger.info("promoting the first cluster")
-    run_action = await leader_unit.run_action("promote-cluster")
+    run_action = await leader_unit.run_action("create-replication")
     await run_action.wait()
     assert (run_action.results.get("return-code", None) == 0) or (
         run_action.results.get("Code", None) == "0"
@@ -221,6 +231,19 @@ async def test_async_replication(
 @pytest.mark.group(1)
 @markers.juju3
 @pytest.mark.abort_on_fail
+async def test_get_data_integrator_credentials(
+    ops_test: OpsTest,
+):
+    unit = ops_test.model.applications[DATA_INTEGRATOR_APP_NAME].units[0]
+    action = await unit.run_action(action_name="get-credentials")
+    result = await action.wait()
+    global data_integrator_credentials
+    data_integrator_credentials = result.results
+
+
+@pytest.mark.group(1)
+@markers.juju3
+@pytest.mark.abort_on_fail
 async def test_switchover(
     ops_test: OpsTest,
     first_model: Model,
@@ -228,10 +251,10 @@ async def test_switchover(
     second_model_continuous_writes,
 ):
     """Test switching over to the second cluster."""
-    second_offer_command = f"offer {DATABASE_APP_NAME}:async-replica async-replica"
+    second_offer_command = f"offer {DATABASE_APP_NAME}:replication replication"
     await ops_test.juju(*second_offer_command.split())
     second_consume_command = (
-        f"consume -m {second_model.info.name} admin/{first_model.info.name}.async-replica"
+        f"consume -m {second_model.info.name} admin/{first_model.info.name}.replication"
     )
     await ops_test.juju(*second_consume_command.split())
 
@@ -250,7 +273,7 @@ async def test_switchover(
     leader_unit = await get_leader_unit(ops_test, DATABASE_APP_NAME, model=second_model)
     assert leader_unit is not None, "No leader unit found"
     logger.info("promoting the second cluster")
-    run_action = await leader_unit.run_action("promote-cluster", **{"force-promotion": True})
+    run_action = await leader_unit.run_action("promote-to-primary", **{"force": True})
     await run_action.wait()
     assert (run_action.results.get("return-code", None) == 0) or (
         run_action.results.get("Code", None) == "0"
@@ -276,6 +299,29 @@ async def test_switchover(
 @pytest.mark.group(1)
 @markers.juju3
 @pytest.mark.abort_on_fail
+async def test_data_integrator_creds_keep_on_working(
+    ops_test: OpsTest,
+    second_model: Model,
+) -> None:
+    user = data_integrator_credentials["postgresql"]["username"]
+    password = data_integrator_credentials["postgresql"]["password"]
+    database = data_integrator_credentials["postgresql"]["database"]
+
+    any_unit = second_model.applications[DATABASE_APP_NAME].units[0].name
+    primary = await get_primary(ops_test, any_unit, second_model)
+    address = second_model.units.get(primary).public_address
+
+    connstr = f"dbname='{database}' user='{user}' host='{address}' port='5432' password='{password}' connect_timeout=1"
+    try:
+        with psycopg2.connect(connstr) as connection:
+            pass
+    finally:
+        connection.close()
+
+
+@pytest.mark.group(1)
+@markers.juju3
+@pytest.mark.abort_on_fail
 async def test_promote_standby(
     ops_test: OpsTest,
     first_model: Model,
@@ -288,16 +334,16 @@ async def test_promote_standby(
         "database", f"{APPLICATION_NAME}:first-database"
     )
     await second_model.applications[DATABASE_APP_NAME].remove_relation(
-        "async-replica", "async-primary"
+        "replication", "replication-offer"
     )
-    wait_for_relation_removed_between(ops_test, "async-primary", "async-replica", second_model)
+    wait_for_relation_removed_between(ops_test, "replication-offer", "replication", second_model)
     async with ops_test.fast_forward(FAST_INTERVAL), fast_forward(second_model, FAST_INTERVAL):
         await gather(
             first_model.wait_for_idle(
-                apps=[DATABASE_APP_NAME],
-                status="blocked",
-                idle_period=IDLE_PERIOD,
-                timeout=TIMEOUT,
+                apps=[DATABASE_APP_NAME], idle_period=IDLE_PERIOD, timeout=TIMEOUT
+            ),
+            first_model.block_until(
+                lambda: first_model.applications[DATABASE_APP_NAME].status == "blocked",
             ),
             second_model.wait_for_idle(
                 apps=[DATABASE_APP_NAME], status="active", idle_period=IDLE_PERIOD, timeout=TIMEOUT
@@ -308,7 +354,7 @@ async def test_promote_standby(
     leader_unit = await get_leader_unit(ops_test, DATABASE_APP_NAME)
     assert leader_unit is not None, "No leader unit found"
     logger.info("promoting the first cluster")
-    run_action = await leader_unit.run_action("promote-cluster")
+    run_action = await leader_unit.run_action("promote-to-primary")
     await run_action.wait()
     assert (run_action.results.get("return-code", None) == 0) or (
         run_action.results.get("Code", None) == "0"
@@ -365,7 +411,7 @@ async def test_reestablish_relation(
     await are_writes_increasing(ops_test)
 
     logger.info("reestablishing the relation")
-    await second_model.relate(DATABASE_APP_NAME, "async-primary")
+    await second_model.relate(DATABASE_APP_NAME, "replication-offer")
     async with ops_test.fast_forward(FAST_INTERVAL), fast_forward(second_model, FAST_INTERVAL):
         await gather(
             first_model.wait_for_idle(
@@ -384,7 +430,7 @@ async def test_reestablish_relation(
     leader_unit = await get_leader_unit(ops_test, DATABASE_APP_NAME)
     assert leader_unit is not None, "No leader unit found"
     logger.info("promoting the first cluster")
-    run_action = await leader_unit.run_action("promote-cluster")
+    run_action = await leader_unit.run_action("create-replication")
     await run_action.wait()
     assert (run_action.results.get("return-code", None) == 0) or (
         run_action.results.get("Code", None) == "0"

@@ -115,6 +115,12 @@ class PostgreSQLProvider(Object):
             # Set the database name
             self.database_provides.set_database(event.relation.id, database)
 
+            # Set connection string URI.
+            self.database_provides.set_uris(
+                event.relation.id,
+                f"postgresql://{user}:{password}@{self.charm.primary_endpoint}:{DATABASE_PORT}/{database}",
+            )
+
             self._update_unit_status(event.relation)
         except (
             PostgreSQLCreateDatabaseError,
@@ -136,6 +142,8 @@ class PostgreSQLProvider(Object):
         """Remove users from database if their relations were broken."""
         if not self.charm.unit.is_leader():
             return
+
+        delete_user = "suppress-oversee-users" not in self.charm.app_peer_data
 
         # Retrieve database users.
         try:
@@ -159,13 +167,16 @@ class PostgreSQLProvider(Object):
 
         # Delete that users that exist in the database but not in the active relations.
         for user in database_users - relation_users:
-            try:
-                logger.info("Remove relation user: %s", user)
-                self.charm.set_secret(APP_SCOPE, user, None)
-                self.charm.set_secret(APP_SCOPE, f"{user}-database", None)
-                self.charm.postgresql.delete_user(user)
-            except PostgreSQLDeleteUserError:
-                logger.error(f"Failed to delete user {user}")
+            if delete_user:
+                try:
+                    logger.info("Remove relation user: %s", user)
+                    self.charm.set_secret(APP_SCOPE, user, None)
+                    self.charm.set_secret(APP_SCOPE, f"{user}-database", None)
+                    self.charm.postgresql.delete_user(user)
+                except PostgreSQLDeleteUserError:
+                    logger.error("Failed to delete user %s", user)
+            else:
+                logger.info("Stale relation user detected: %s", user)
 
     def update_endpoints(self, event: DatabaseRequestedEvent = None) -> None:
         """Set the read/write and read-only endpoints."""

@@ -1,9 +1,11 @@
 # Copyright 2021 Canonical Ltd.
 # See LICENSE file for licensing details.
 import itertools
+import json
 import logging
 import platform
 import subprocess
+from unittest import TestCase
 from unittest.mock import MagicMock, Mock, PropertyMock, call, mock_open, patch, sentinel
 
 import pytest
@@ -26,16 +28,20 @@ from ops.testing import Harness
 from psycopg2 import OperationalError
 from tenacity import RetryError, wait_fixed
 
+from backups import CANNOT_RESTORE_PITR
 from charm import (
     EXTENSIONS_DEPENDENCY_MESSAGE,
     PRIMARY_NOT_REACHABLE_MESSAGE,
     PostgresqlOperatorCharm,
 )
-from cluster import RemoveRaftMemberFailedError
+from cluster import NotReadyError, RemoveRaftMemberFailedError
 from constants import PEER, POSTGRESQL_SNAP_NAME, SECRET_INTERNAL_LABEL, SNAP_PACKAGES
 from tests.helpers import patch_network_get
 
 CREATE_CLUSTER_CONF_PATH = "/etc/postgresql-common/createcluster.d/pgcharm.conf"
+
+# used for assert functions
+tc = TestCase()
 
 
 @pytest.fixture(autouse=True)
@@ -165,7 +171,9 @@ def test_patroni_scrape_config_tls(harness):
 
 
 def test_primary_endpoint(harness):
-    with patch(
+    with patch("charm.stop_after_delay", new_callable=PropertyMock) as _stop_after_delay, patch(
+        "charm.wait_fixed", new_callable=PropertyMock
+    ) as _wait_fixed, patch(
         "charm.PostgresqlOperatorCharm._units_ips",
         new_callable=PropertyMock,
         return_value={"1.1.1.1", "1.1.1.2"},
@@ -173,6 +181,10 @@ def test_primary_endpoint(harness):
         _patroni.return_value.get_member_ip.return_value = "1.1.1.1"
         _patroni.return_value.get_primary.return_value = sentinel.primary
         assert harness.charm.primary_endpoint == "1.1.1.1"
+
+        # Check needed to ensure a fast charm deployment.
+        _stop_after_delay.assert_called_once_with(5)
+        _wait_fixed.assert_called_once_with(3)
 
         _patroni.return_value.get_member_ip.assert_called_once_with(sentinel.primary)
         _patroni.return_value.get_primary.assert_called_once_with()
@@ -548,6 +560,12 @@ def test_enable_disable_extensions(harness, caplog):
 def test_on_start(harness):
     with (
         patch(
+            "charm.PostgresqlOperatorCharm._restart_services_after_reboot"
+        ) as _restart_services_after_reboot,
+        patch(
+            "charm.PostgresqlOperatorCharm._set_primary_status_message"
+        ) as _set_primary_status_message,
+        patch(
             "charm.PostgresqlOperatorCharm.enable_disable_extensions"
         ) as _enable_disable_extensions,
         patch("charm.snap.SnapCache") as _snap_cache,
@@ -603,26 +621,31 @@ def test_on_start(harness):
         harness.charm.on.start.emit()
         _bootstrap_cluster.assert_called_once()
         _oversee_users.assert_not_called()
+        _restart_services_after_reboot.assert_called_once()
         assert isinstance(harness.model.unit.status, BlockedStatus)
         # Set an initial waiting status (like after the install hook was triggered).
         harness.model.unit.status = WaitingStatus("fake message")
 
         # Test the event of an error happening when trying to create the default postgres user.
+        _restart_services_after_reboot.reset_mock()
         _member_started.return_value = True
         harness.charm.on.start.emit()
         _postgresql.create_user.assert_called_once()
         _oversee_users.assert_not_called()
+        _restart_services_after_reboot.assert_called_once()
         assert isinstance(harness.model.unit.status, BlockedStatus)
 
         # Set an initial waiting status again (like after the install hook was triggered).
         harness.model.unit.status = WaitingStatus("fake message")
 
         # Then test the event of a correct cluster bootstrapping.
+        _restart_services_after_reboot.reset_mock()
         harness.charm.on.start.emit()
         assert _postgresql.create_user.call_count == 4  # Considering the previous failed call.
         _oversee_users.assert_called_once()
         _enable_disable_extensions.assert_called_once()
-        assert isinstance(harness.model.unit.status, ActiveStatus)
+        _set_primary_status_message.assert_called_once()
+        _restart_services_after_reboot.assert_called_once()
 
 
 @patch_network_get(private_address="1.1.1.1")
@@ -630,6 +653,9 @@ def test_on_start_replica(harness):
     with (
         patch("charm.snap.SnapCache") as _snap_cache,
         patch("charm.Patroni.get_postgresql_version") as _get_postgresql_version,
+        patch(
+            "charm.PostgresqlOperatorCharm._restart_services_after_reboot"
+        ) as _restart_services_after_reboot,
         patch("charm.Patroni.configure_patroni_on_unit") as _configure_patroni_on_unit,
         patch(
             "charm.Patroni.member_started",
@@ -660,15 +686,18 @@ def test_on_start_replica(harness):
         harness.charm._peers.data[harness.charm.app].update({"cluster_initialised": ""})
         harness.charm.on.start.emit()
         _defer.assert_called_once()
+        _restart_services_after_reboot.assert_called_once()
 
         # Set an initial waiting status again (like after a machine restart).
         harness.model.unit.status = WaitingStatus("fake message")
 
         # Mark the cluster as initialised and with the workload up and running.
+        _restart_services_after_reboot.reset_mock()
         harness.charm._peers.data[harness.charm.app].update({"cluster_initialised": "True"})
         _member_started.return_value = True
         harness.charm.on.start.emit()
         _configure_patroni_on_unit.assert_not_called()
+        _restart_services_after_reboot.assert_called_once()
         assert isinstance(harness.model.unit.status, ActiveStatus)
 
         # Set an initial waiting status (like after the install hook was triggered).
@@ -676,9 +705,11 @@ def test_on_start_replica(harness):
 
         # Check that the unit status doesn't change when the workload is not running.
         # In that situation only Patroni is configured in the unit (but not started).
+        _restart_services_after_reboot.reset_mock()
         _member_started.return_value = False
         harness.charm.on.start.emit()
         _configure_patroni_on_unit.assert_called_once()
+        _restart_services_after_reboot.assert_called_once()
         assert isinstance(harness.model.unit.status, WaitingStatus)
 
 
@@ -860,6 +891,14 @@ def test_on_update_status(harness):
         ) as _primary_endpoint,
         patch("charm.PostgreSQLProvider.oversee_users") as _oversee_users,
         patch("upgrade.PostgreSQLUpgrade.idle", return_value=True),
+        patch("charm.Patroni.last_postgresql_logs") as _last_postgresql_logs,
+        patch("charm.Patroni.patroni_logs") as _patroni_logs,
+        patch("charm.Patroni.get_member_status") as _get_member_status,
+        patch(
+            "charm.PostgreSQLBackups.can_use_s3_repository", return_value=(True, None)
+        ) as _can_use_s3_repository,
+        patch("charm.PostgresqlOperatorCharm.update_config") as _update_config,
+        patch("charm.PostgresqlOperatorCharm.log_pitr_last_transaction_time"),
     ):
         rel_id = harness.model.get_relation(PEER).id
         # Test before the cluster is initialised.
@@ -868,6 +907,7 @@ def test_on_update_status(harness):
 
         # Test after the cluster was initialised, but with the unit in a blocked state.
         with harness.hooks_disabled():
+            harness.set_leader()
             harness.update_relation_data(
                 rel_id, harness.charm.app.name, {"cluster_initialised": "True"}
             )
@@ -875,7 +915,30 @@ def test_on_update_status(harness):
         harness.charm.on.update_status.emit()
         _set_primary_status_message.assert_not_called()
 
+        # Test the point-in-time-recovery fail.
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                rel_id,
+                harness.charm.app.name,
+                {
+                    "cluster_initialised": "True",
+                    "restoring-backup": "valid",
+                    "restore-to-time": "valid",
+                },
+            )
+        harness.charm.unit.status = ActiveStatus()
+        _patroni_logs.return_value = "2022-02-24 02:00:00 UTC patroni.exceptions.PatroniFatalException: Failed to bootstrap cluster"
+        harness.charm.on.update_status.emit()
+        _set_primary_status_message.assert_not_called()
+        assert harness.charm.unit.status.message == CANNOT_RESTORE_PITR
+
         # Test with the unit in a status different that blocked.
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                rel_id,
+                harness.charm.app.name,
+                {"cluster_initialised": "True", "restoring-backup": "", "restore-to-time": ""},
+            )
         harness.charm.unit.status = ActiveStatus()
         harness.charm.on.update_status.emit()
         _set_primary_status_message.assert_called_once()
@@ -1215,6 +1278,9 @@ def test_update_config(harness):
             backup_id=None,
             stanza=None,
             restore_stanza=None,
+            pitr_target=None,
+            restore_to_latest=False,
+            disable_pgbackrest_archiving=False,
             parameters={"test": "test"},
         )
         _handle_postgresql_restart_need.assert_called_once_with(False)
@@ -1235,6 +1301,9 @@ def test_update_config(harness):
             backup_id=None,
             stanza=None,
             restore_stanza=None,
+            pitr_target=None,
+            restore_to_latest=False,
+            disable_pgbackrest_archiving=False,
             parameters={"test": "test"},
         )
         _handle_postgresql_restart_need.assert_called_once()
@@ -1727,6 +1796,59 @@ def test_client_relations(harness):
     db_relation = harness.model.get_relation("db")
     db_admin_relation = harness.model.get_relation("db-admin")
     assert harness.charm.client_relations == [database_relation, db_relation, db_admin_relation]
+
+
+def test_on_pgdata_storage_detaching(harness):
+    with (
+        patch(
+            "charm.PostgresqlOperatorCharm._update_relation_endpoints"
+        ) as _update_relation_endpoints,
+        patch("charm.PostgresqlOperatorCharm.primary_endpoint", new_callable=PropertyMock),
+        patch("charm.Patroni.are_all_members_ready") as _are_all_members_ready,
+        patch("charm.Patroni.get_primary", return_value="primary") as _get_primary,
+        patch("charm.Patroni.switchover") as _switchover,
+        patch("charm.Patroni.primary_changed") as _primary_changed,
+    ):
+        # Early exit if not primary
+        event = Mock()
+        harness.charm._on_pgdata_storage_detaching(event)
+        assert not _are_all_members_ready.called
+
+        _get_primary.side_effect = [harness.charm.unit.name, "primary"]
+        harness.charm._on_pgdata_storage_detaching(event)
+        _switchover.assert_called_once_with()
+        _primary_changed.assert_called_once_with("primary")
+        _update_relation_endpoints.assert_called_once_with()
+
+
+def test_add_cluster_member(harness):
+    with (
+        patch("charm.PostgresqlOperatorCharm.update_config") as _update_config,
+        patch("charm.PostgresqlOperatorCharm._get_unit_ip", return_value="1.1.1.1"),
+        patch("charm.PostgresqlOperatorCharm._add_to_members_ips") as _add_to_members_ips,
+        patch("charm.Patroni.are_all_members_ready") as _are_all_members_ready,
+    ):
+        harness.charm.add_cluster_member("postgresql/0")
+
+        _add_to_members_ips.assert_called_once_with("1.1.1.1")
+        _update_config.assert_called_once_with()
+        _update_config.reset_mock()
+
+        # Charm blocks when update_config fails
+        _update_config.side_effect = RetryError(last_attempt=None)
+        harness.charm.add_cluster_member("postgresql/0")
+        _update_config.assert_called_once_with()
+        assert isinstance(harness.charm.unit.status, BlockedStatus)
+        assert harness.charm.unit.status.message == "failed to update cluster members on member"
+        _update_config.reset_mock()
+
+        # Not ready error if not all members are ready
+        _are_all_members_ready.return_value = False
+        try:
+            harness.charm.add_cluster_member("postgresql/0")
+            assert False
+        except NotReadyError:
+            pass
 
 
 #
@@ -2260,16 +2382,51 @@ def test_update_new_unit_status(harness):
         handle_read_only_mode.assert_not_called()
         assert isinstance(harness.charm.unit.status, WaitingStatus)
 
-    @patch("charm.Patroni.member_started", new_callable=PropertyMock)
-    @patch("charm.PostgresqlOperatorCharm.is_standby_leader", new_callable=PropertyMock)
-    @patch("charm.Patroni.get_primary")
-    def test_set_active_status(self, _get_primary, _is_standby_leader, _member_started):
+
+@pytest.mark.parametrize("is_leader", [True, False])
+def test_set_primary_status_message(harness, is_leader):
+    with (
+        patch("charm.Patroni.member_started", new_callable=PropertyMock) as _member_started,
+        patch(
+            "charm.PostgresqlOperatorCharm.is_standby_leader", new_callable=PropertyMock
+        ) as _is_standby_leader,
+        patch("charm.Patroni.get_primary") as _get_primary,
+    ):
+        # Test scenario when it's needed to move to another S3 bucket after a restore.
+        databag_containing_restore_data = {
+            "require-change-bucket-after-restore": "True",
+            "restoring-backup": "2024-01-01T09:00:00Z",
+            "restore-stanza": "fake-stanza",
+            "restore-to-time": "",
+        }
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                harness.model.get_relation(PEER).id,
+                harness.charm.app.name,
+                databag_containing_restore_data,
+            )
+            harness.set_leader(is_leader)
+        harness.charm._set_primary_status_message()
+        harness.get_relation_data(harness.model.get_relation(PEER).id, harness.charm.app.name) == (
+            {"require-change-bucket-after-restore": "True"}
+            if is_leader
+            else databag_containing_restore_data
+        )
+        tc.assertIsInstance(harness.charm.unit.status, BlockedStatus)
+
+        # Test other scenarios.
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                harness.model.get_relation(PEER).id,
+                harness.charm.app.name,
+                {"require-change-bucket-after-restore": ""},
+            )
         for values in itertools.product(
             [
                 RetryError(last_attempt=1),
                 ConnectionError,
-                self.charm.unit.name,
-                f"{self.charm.app.name}/2",
+                harness.charm.unit.name,
+                f"{harness.charm.app.name}/2",
             ],
             [
                 RetryError(last_attempt=1),
@@ -2279,36 +2436,136 @@ def test_update_new_unit_status(harness):
             ],
             [True, False],
         ):
-            self.charm.unit.status = MaintenanceStatus("fake status")
+            harness.charm.unit.status = MaintenanceStatus("fake status")
             _member_started.return_value = values[2]
             if isinstance(values[0], str):
                 _get_primary.side_effect = None
                 _get_primary.return_value = values[0]
-                if values[0] != self.charm.unit.name and not isinstance(values[1], bool):
+                if values[0] != harness.charm.unit.name and not isinstance(values[1], bool):
                     _is_standby_leader.side_effect = values[1]
                     _is_standby_leader.return_value = None
-                    self.charm._set_active_status()
-                    self.assertIsInstance(self.charm.unit.status, MaintenanceStatus)
+                    harness.charm._set_primary_status_message()
+                    tc.assertIsInstance(harness.charm.unit.status, MaintenanceStatus)
                 else:
                     _is_standby_leader.side_effect = None
                     _is_standby_leader.return_value = values[1]
-                    self.charm._set_active_status()
-                    self.assertIsInstance(
-                        self.charm.unit.status,
+                    harness.charm._set_primary_status_message()
+                    tc.assertIsInstance(
+                        harness.charm.unit.status,
                         ActiveStatus
-                        if values[0] == self.charm.unit.name or values[1] or values[2]
+                        if values[0] == harness.charm.unit.name or values[1] or values[2]
                         else MaintenanceStatus,
                     )
-                    self.assertEqual(
-                        self.charm.unit.status.message,
+                    tc.assertEqual(
+                        harness.charm.unit.status.message,
                         "Primary"
-                        if values[0] == self.charm.unit.name
-                        else (
-                            "Standby Leader" if values[1] else ("" if values[2] else "fake status")
-                        ),
+                        if values[0] == harness.charm.unit.name
+                        else ("Standby" if values[1] else ("" if values[2] else "fake status")),
                     )
             else:
                 _get_primary.side_effect = values[0]
                 _get_primary.return_value = None
-                self.charm._set_active_status()
-                self.assertIsInstance(self.charm.unit.status, MaintenanceStatus)
+                harness.charm._set_primary_status_message()
+                tc.assertIsInstance(harness.charm.unit.status, MaintenanceStatus)
+
+
+def test_override_patroni_restart_condition(harness):
+    with (
+        patch("charm.Patroni.update_patroni_restart_condition") as _update_restart_condition,
+        patch("charm.Patroni.get_patroni_restart_condition") as _get_restart_condition,
+        patch("charm.PostgresqlOperatorCharm._unit_ip") as _unit_ip,
+    ):
+        _get_restart_condition.return_value = "always"
+
+        # Do override without repeat_cause
+        assert harness.charm.override_patroni_restart_condition("no", None) is True
+        _get_restart_condition.assert_called_once()
+        _update_restart_condition.assert_called_once_with("no")
+        _get_restart_condition.reset_mock()
+        _update_restart_condition.reset_mock()
+
+        _get_restart_condition.return_value = "no"
+
+        # Must not be overridden twice without repeat_cause
+        assert harness.charm.override_patroni_restart_condition("on-failure", None) is False
+        _get_restart_condition.assert_called_once()
+        _update_restart_condition.assert_not_called()
+        _get_restart_condition.reset_mock()
+        _update_restart_condition.reset_mock()
+
+        # Reset override
+        harness.charm.restore_patroni_restart_condition()
+        _update_restart_condition.assert_called_once_with("always")
+        _update_restart_condition.reset_mock()
+
+        # Must not be reset twice
+        harness.charm.restore_patroni_restart_condition()
+        _update_restart_condition.assert_not_called()
+        _update_restart_condition.reset_mock()
+
+        _get_restart_condition.return_value = "always"
+
+        # Do override with repeat_cause
+        assert harness.charm.override_patroni_restart_condition("no", "test_charm") is True
+        _get_restart_condition.assert_called_once()
+        _update_restart_condition.assert_called_once_with("no")
+        _get_restart_condition.reset_mock()
+        _update_restart_condition.reset_mock()
+
+        _get_restart_condition.return_value = "no"
+
+        # Do re-override with repeat_cause
+        assert harness.charm.override_patroni_restart_condition("on-success", "test_charm") is True
+        _get_restart_condition.assert_called_once()
+        _update_restart_condition.assert_called_once_with("on-success")
+        _get_restart_condition.reset_mock()
+        _update_restart_condition.reset_mock()
+
+        _get_restart_condition.return_value = "on-success"
+
+        # Must not be re-overridden with different repeat_cause
+        assert (
+            harness.charm.override_patroni_restart_condition("on-failure", "test_not_charm")
+            is False
+        )
+        _get_restart_condition.assert_called_once()
+        _update_restart_condition.assert_not_called()
+        _get_restart_condition.reset_mock()
+        _update_restart_condition.reset_mock()
+
+        # Reset override
+        harness.charm.restore_patroni_restart_condition()
+        _update_restart_condition.assert_called_once_with("always")
+        _update_restart_condition.reset_mock()
+
+
+def test_restart_services_after_reboot(harness):
+    with (
+        patch(
+            "backups.PostgreSQLBackups.start_stop_pgbackrest_service"
+        ) as _start_stop_pgbackrest_service,
+        patch("charm.Patroni.start_patroni") as _start_patroni,
+        patch(
+            "charm.PostgresqlOperatorCharm._unit_ip",
+            new_callable=PropertyMock(return_value="1.1.1.1"),
+        ) as _unit_ip,
+    ):
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                harness.model.get_relation(PEER).id,
+                harness.charm.app.name,
+                {"members_ips": json.dumps([])},
+            )
+        harness.charm._restart_services_after_reboot()
+        _start_patroni.assert_not_called()
+        _start_stop_pgbackrest_service.assert_not_called()
+
+        with harness.hooks_disabled():
+            harness.update_relation_data(
+                harness.model.get_relation(PEER).id,
+                harness.charm.app.name,
+                {"members_ips": json.dumps([_unit_ip])},
+            )
+        harness.charm._restart_services_after_reboot()
+        _start_patroni.assert_called_once()
+        _start_stop_pgbackrest_service.assert_called_once()

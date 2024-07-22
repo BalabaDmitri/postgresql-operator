@@ -113,6 +113,7 @@ async def test_build_and_deploy(ops_test: OpsTest) -> None:
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 async def test_storage_re_use(ops_test, continuous_writes):
     """Verifies that database units with attached storage correctly repurpose storage.
 
@@ -160,6 +161,7 @@ async def test_storage_re_use(ops_test, continuous_writes):
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 @pytest.mark.parametrize("process", DB_PROCESSES)
 async def test_kill_db_process(
     ops_test: OpsTest, process: str, continuous_writes, primary_start_timeout
@@ -188,6 +190,7 @@ async def test_kill_db_process(
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 @pytest.mark.parametrize("process", DB_PROCESSES)
 async def test_freeze_db_process(
     ops_test: OpsTest, process: str, continuous_writes, primary_start_timeout
@@ -226,6 +229,7 @@ async def test_freeze_db_process(
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 @pytest.mark.parametrize("process", DB_PROCESSES)
 async def test_restart_db_process(
     ops_test: OpsTest, process: str, continuous_writes, primary_start_timeout
@@ -254,6 +258,7 @@ async def test_restart_db_process(
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 @pytest.mark.parametrize("process", DB_PROCESSES)
 @pytest.mark.parametrize("signal", ["SIGTERM", "SIGKILL"])
 async def test_full_cluster_restart(
@@ -290,7 +295,7 @@ async def test_full_cluster_restart(
     # of all replicas being down at the same time.
     try:
         assert await are_all_db_processes_down(
-            ops_test, process
+            ops_test, process, signal
         ), "Not all units down at the same time."
     finally:
         if process == PATRONI_PROCESS:
@@ -322,6 +327,7 @@ async def test_full_cluster_restart(
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 @pytest.mark.unstable
 async def test_forceful_restart_without_data_and_transaction_logs(
     ops_test: OpsTest,
@@ -398,6 +404,7 @@ async def test_forceful_restart_without_data_and_transaction_logs(
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 async def test_network_cut(ops_test: OpsTest, continuous_writes, primary_start_timeout):
     """Completely cut and restore network."""
     # Locate primary unit.
@@ -486,6 +493,7 @@ async def test_network_cut(ops_test: OpsTest, continuous_writes, primary_start_t
 
 
 @pytest.mark.group(1)
+@pytest.mark.abort_on_fail
 async def test_network_cut_without_ip_change(
     ops_test: OpsTest, continuous_writes, primary_start_timeout
 ):

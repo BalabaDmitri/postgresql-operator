@@ -28,6 +28,8 @@ USER_PASSWORD_KEY = "operator-password"
 MONITORING_USER = "monitoring"
 MONITORING_PASSWORD_KEY = "monitoring-password"
 MONITORING_SNAP_SERVICE = "prometheus-postgres-exporter"
+PATRONI_SERVICE_NAME = "snap.charmed-postgresql.patroni.service"
+PATRONI_SERVICE_DEFAULT_PATH = f"/etc/systemd/system/{PATRONI_SERVICE_NAME}"
 # List of system usernames needed for correct work of the charm/workload.
 SYSTEM_USERS = [BACKUP_USER, REPLICATION_USER, REWIND_USER, USER, MONITORING_USER]
 
@@ -37,7 +39,10 @@ POSTGRESQL_SNAP_NAME = "charmed-postgresql"
 SNAP_PACKAGES = [
     (
         POSTGRESQL_SNAP_NAME,
-        {"revision": {"aarch64": "114", "x86_64": "115"}, "channel": "14/stable"},
+        {
+            "revision": {"aarch64": "121", "x86_64": "120"},
+            "channel": "14/stable",
+        },
     )
 ]
 
@@ -73,4 +78,8 @@ SECRET_KEY_OVERRIDES = {"ca": "cauth"}
 ENDPOINT_SIMULTANEOUSLY_BLOCKING_MESSAGE = (
     "Please choose one endpoint to use. No need to relate all of them simultaneously!"
 )
+
+TRACING_RELATION_NAME = "tracing"
+TRACING_PROTOCOL = "otlp_http"
+
 BACKUP_TYPE_OVERRIDES = {"full": "full", "differential": "diff", "incremental": "incr"}
