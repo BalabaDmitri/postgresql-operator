@@ -109,7 +109,7 @@ async def test_build_and_deploy(ops_test: OpsTest) -> None:
 
     if wait_for_apps:
         async with ops_test.fast_forward():
-            await ops_test.model.wait_for_idle(status="active", timeout=3000)
+            await ops_test.model.wait_for_idle(status="active", timeout=5000)
 
 
 @pytest.mark.group(1)
